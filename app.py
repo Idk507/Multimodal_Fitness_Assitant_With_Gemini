@@ -1,201 +1,242 @@
 import streamlit as st
-import google.generativeai as genai
-from PIL import Image
-import re
-from dotenv import load_dotenv
 import os
+import re
+import time
+from dotenv import load_dotenv
+import google.generativeai as genai
+from langchain.memory import ConversationBufferMemory
+from langchain.schema import SystemMessage, HumanMessage, AIMessage
+from langchain.agents import initialize_agent, Tool
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain.llms.base import LLM
+from googletrans import Translator
 import speech_recognition as sr
-import tempfile
-from pydub import AudioSegment
-from pydub.playback import play
+from PIL import Image
+from typing import Optional, List
 
-# Load environment variables
+
+
 load_dotenv()
-
-# Configure Google Generative AI
-GOOGLE_API_KEY = ""
+GOOGLE_API_KEY = "" 
+if not GOOGLE_API_KEY:
+    st.warning("GOOGLE_API_KEY is not set.")
 genai.configure(api_key=GOOGLE_API_KEY)
+translator = Translator()
 
-# Action regex to identify actions in the chatbot response
-action_re = re.compile(r'^Action:\s*(\w+)\s*:\s*(.+)$')
+# Custom Google LLM compatible with LangChain
+class GoogleGenAI(LLM):
+    @property
+    def _llm_type(self) -> str:
+        return "google-generativeai"
 
-# Define the chatbot class and action functions
-class Chatbot:
-    def __init__(self, system):
-        self.system = system
-        self.messages = []
-        if self.system:
-            self.messages.append({"role": "system", "content": system})
-
-    def __call__(self, message):
-        self.messages.append({"role": "user", "content": message})
-        result = self.execute()
-        self.messages.append({"role": "assistant", "content": result})
-        return result
-
-    def execute(self):
-        prompt = "\n".join([f'{msg["role"]}:{msg["content"]}' for msg in self.messages])
+    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
         model = genai.GenerativeModel("gemini-1.5-flash")
-        raw_response = model.generate_content(prompt)
-        result_text = raw_response.candidates[0].content.parts[0].text
-        return result_text
+        response = model.generate_content(prompt)
+        return response.candidates[0].content.parts[0].text
 
-# Action functions using Gemini API
-def generate_workout(level):
-    response = genai.GenerativeModel("gemini-1.5-flash").generate_content(f"Generate a workout plan for a {level} fitness level")
-    return response.candidates[0].content.parts[0].text
+    async def _acall(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        return self._call(prompt, stop)
 
-def suggest_meal(preferences):
-    response = genai.GenerativeModel("gemini-1.5-flash").generate_content(f"Suggest a meal plan with {preferences}")
-    return response.candidates[0].content.parts[0].text
+# Instantiate the custom LLM
+google_llm = GoogleGenAI()
 
-def motivational_quotes():
-    response = genai.GenerativeModel("gemini-1.5-flash").generate_content("Give me a motivational quote.")
-    return response.candidates[0].content.parts[0].text
+# Search Tool
+duckduckgo_tool = DuckDuckGoSearchRun()
+search_tool = Tool(
+    name="DuckDuckGo Search",
+    func=duckduckgo_tool.run,
+    description="Useful for searching online for product recommendations, reviews, and purchase links."
+)
 
-# Known actions mapping
+# Initialize LangChain agent
+agent = initialize_agent(
+    tools=[search_tool],
+    llm=google_llm,
+    agent="zero-shot-react-description",
+    verbose=True,
+    handle_parsing_errors=True
+)
+
+action_re = re.compile(r'^Action:\s*(\w+)\s*:\s*(.*)$')
+
+# System Prompt
+system_prompt = """
+You are a fitness assistant and product recommendation agent. You help users with workout plans, dietary advice, motivational quotes, and also recommend live protein supplements and the best diet food hotels/products available online.
+Your available actions are:
+generate_workout: e.g. generate_workout: Beginner 
+suggest_meal: e.g. suggest_meal: Low-carb breakfast 
+motivational_quotes: e.g. motivational_quotes:
+recommend_protein: e.g. recommend_protein:
+recommend_diet_hotels: e.g. recommend_diet_hotels:
+"""
+
+# Action Functions
+def generate_workout(level: str) -> str:
+    return google_llm._call(f"Generate a workout plan for a {level} fitness level.")
+
+def suggest_meal(preferences: str) -> str:
+    return google_llm._call(f"Suggest a meal plan with {preferences}.")
+
+def motivational_quotes() -> str:
+    return google_llm._call("Give me a motivational quote.")
+
+def recommend_protein() -> str:
+    return agent.run("Recommend live protein supplements available online with detailed product information, nutritional facts, prices, and purchase links.")
+
+def recommend_diet_hotels() -> str:
+    return agent.run("Recommend the best diet food hotels or healthy food product outlets available online with details and links.")
+
 known_actions = {
     "generate_workout": generate_workout,
     "suggest_meal": suggest_meal,
-    "motivational_quotes": motivational_quotes
+    "motivational_quotes": motivational_quotes,
+    "recommend_protein": recommend_protein,
+    "recommend_diet_hotels": recommend_diet_hotels
 }
 
-# Query function that interacts with the chatbot
-def query(question, max_turns=5):
-    i = 0
-    bot = Chatbot(system_prompt)
-    next_prompt = question
-    while i < max_turns:
-        i += 1
-        result = bot(next_prompt)
-        actions = [action_re.match(a) for a in result.split('\n') if action_re.match(a)]
-        
-        if actions:
-            action, action_input = actions[0].groups()
-            if action not in known_actions:
-                raise Exception(f"Unknown action: {action}: {action_input}")
-            observation = known_actions[action](action_input.strip())
-            next_prompt = f"Answer: {observation}"
-        else:
-            return result
+# Chatbot Class
+class Chatbot:
+    def __init__(self, system: str, memory: ConversationBufferMemory):
+        self.system = system
+        self.memory = memory
+        self.memory.chat_memory.messages.append(SystemMessage(content=system))
 
-# Define the system prompt
-system_prompt = """ 
-You are a fitness assistant. You help users with workout plans, dietary advice, and motivational quotes.
-Your available actions are:
-generate_workout:
-e.g. generate_workout: Beginner 
-Generates a workout plan based on the user's fitness level.
-suggest_meal:
-e.g. suggest_meal: Low-carb breakfast 
-Suggests a meal plan based on the user's dietary preferences.
-motivational_quotes:
-e.g. motivational_quotes:
-Returns a motivational quote to inspire the user.
-"""
+    def __call__(self, message: str) -> str:
+        self.memory.chat_memory.messages.append(HumanMessage(content=message))
+        result = self.execute()
+        self.memory.chat_memory.messages.append(AIMessage(content=result))
+        return result
 
-# Initialize session state to store chat history and image state
-if 'chat_history' not in st.session_state:
-    st.session_state['chat_history'] = []
-if 'uploaded_image' not in st.session_state:
-    st.session_state['uploaded_image'] = None
+    def execute(self) -> str:
+        conversation = self.memory.load_memory_variables({})
+        prompt = "\n".join([msg.content for msg in conversation["chat_history"]])
+        return google_llm._call(prompt)
 
-# Function to add new messages to chat history
-def add_to_chat_history(user_message, bot_response):
-    st.session_state['chat_history'].append({
-        'user': user_message,
-        'bot': bot_response
-    })
+# Translation Functions
+def translate_to_english(text: str, src_lang: str) -> str:
+    if src_lang.lower() != "en":
+        translated = translator.translate(text, src="auto", dest="en")
+        return translated.text
+    return text
 
-# Display chat history in the sidebar
-st.sidebar.title("Chat History")
-if st.session_state['chat_history']:
-    for idx, chat in enumerate(st.session_state['chat_history']):
-        st.sidebar.write(f"User: {chat['user']}")
-        st.sidebar.write(f"Bot: {chat['bot']}")
-        st.sidebar.write("---")
+def translate_from_english(text: str, target_lang: str) -> str:
+    if target_lang.lower() != "en":
+        translated = translator.translate(text, src="en", dest=target_lang)
+        return translated.text
+    return text
 
-# Function to convert voice to text
-def transcribe_voice(audio_file):
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(audio_file) as source:
-        audio_data = recognizer.record(source)
-        try:
-            return recognizer.recognize_google(audio_data)
-        except sr.UnknownValueError:
-            return "Sorry, I couldn't understand the audio."
-        except sr.RequestError as e:
-            return f"Could not request results from Google Speech Recognition service; {e}"
-
-# Custom HTML5-based audio recorder using JavaScript
-def audio_recorder():
-    audio_html = """
-    <script>
-    const startRecording = () => {
-        const chunks = [];
-        const rec = new MediaRecorder(window.stream);
-
-        rec.ondataavailable = e => chunks.push(e.data);
-        rec.onstop = e => {
-            const completeBlob = new Blob(chunks, { type: 'audio/wav' });
-            const audioURL = window.URL.createObjectURL(completeBlob);
-            document.getElementById('audio').src = audioURL;
-        };
-
-        rec.start();
-        setTimeout(() => rec.stop(), 10000);  // stop after 3 seconds
-    };
-
-    navigator.mediaDevices.getUserMedia({ audio: true })
-        .then(stream => { window.stream = stream });
-
-    </script>
-    <button onclick="startRecording()">Start Recording</button>
-    <audio id="audio" controls></audio>
-    """
-    st.components.v1.html(audio_html)
-
-# Streamlit App interface
-st.title("BRATZLIFE - Fitness Assistant")
-
-# Handle voice input
-st.subheader("Record Your Voice Query:")
-audio_recorder()
-
-# Upload image handling
-uploaded_file = st.file_uploader("Upload a fitness image", type=["png", "jpg", "jpeg"])
-
-# Clear current image when a new query is raised
-if uploaded_file:
-    st.session_state['uploaded_image'] = uploaded_file
-
-# Display image if one is uploaded
-if st.session_state['uploaded_image']:
-    image = Image.open(st.session_state['uploaded_image'])
-    st.image(image, caption='Uploaded Image', use_column_width=True)
-
-# Transcribe voice query if any voice recording is provided
-if st.session_state.get('voice_recording'):
-    voice_query = transcribe_voice(st.session_state['voice_recording'])
-    user_question = voice_query
-
-# Otherwise, accept text input
-else:
-    user_question = st.text_input("Ask a fitness question (about workouts, meals, or motivation)")
-
-# If a text or voice query is entered
-if user_question or uploaded_file:
-    st.write("Processing your request...")
+# Query Processing
+def process_query(question: str, target_language: str, memory):
+    bot = Chatbot(system_prompt, memory)
+    question_in_english = translate_to_english(question, target_language)
+    result = bot(question_in_english)
     
-    # Clear the current image once a query is made
-    if uploaded_file:
-        st.session_state['uploaded_image'] = None
+    actions = [action_re.match(a) for a in result.split('\n') if action_re.match(a)]
+    if actions:
+        action, action_input = actions[0].groups()
+        action = action.strip()
+        action_input = action_input.strip()
+        if action in known_actions:
+            observation = known_actions[action](action_input) if action_input else known_actions[action]()
+            return translate_from_english(observation, target_language)
+    return translate_from_english(result, target_language)
 
+# Voice Input
+def get_voice_query():
+    recognizer = sr.Recognizer()
+    mic = sr.Microphone()
+    with mic as source:
+        recognizer.adjust_for_ambient_noise(source)
+        audio = recognizer.listen(source)
     try:
-        response = query(user_question)
-        st.write(response)
+        return recognizer.recognize_google(audio)
+    except sr.UnknownValueError:
+        return "Sorry, could not understand the audio."
+    except sr.RequestError as e:
+        return f"Error: {e}"
 
-        # Add conversation to chat history
-        add_to_chat_history(user_question, response)
-    except Exception as e:
-        st.error(f"Error: {e}")
+# Image Query Processing
+def process_image_query(image_path: str, user_query: str, target_language: str):
+    sample_file = genai.upload_file(path=image_path, display_name="Image")
+    model = genai.GenerativeModel(model_name="gemini-1.5-pro-latest")
+    prompt = (
+        f"Using the uploaded image and the query '{user_query}', provide fitness-related advice or suggestions. you should reply to the query apart from fitness related query and only should reply to the fitness related query. "
+        f"Make sure to provide a detailed response. \n\n"
+        "The image shows a fitness-related activity or equipment. Assist the user with workout tips, form correction, or equipment usage guidance."
+    )
+    response = model.generate_content([sample_file, prompt])
+    return translate_from_english(response.text, target_language)
+
+# Streamlit App
+st.title("BRATZLIFE - Fitness & Product Recommendation Assistant")
+st.write("Welcome! I can assist with workout plans, meal suggestions, motivational quotes, product recommendations, and image-based fitness advice.")
+
+# Session State for Memory
+if 'memory' not in st.session_state:
+    st.session_state.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+
+# Sidebar: Chat History
+with st.sidebar:
+    st.subheader("Chat History")
+    for chat in st.session_state.chat_history:
+        st.markdown(f"**You:** {chat['user']}")
+        st.markdown(f"**Assistant:** {chat['assistant']}")
+        st.markdown("---")
+
+# Main Area: Input and Image Upload
+col1, col2 = st.columns([2, 1])  # Left for text/voice input, right for image upload
+
+# Left Column: Text and Voice Input
+with col1:
+    st.subheader("Chat Interface")
+    # Language Selection
+    target_language = st.selectbox("Select Language", ["en", "es", "fr", "de"], index=0)
+
+    # Input Mode
+    input_mode = st.radio("Choose Input Mode", ["Text", "Voice"])
+
+    if input_mode == "Text":
+        user_input = st.text_input("Enter your query:")
+        if st.button("Submit") and user_input:
+            with st.spinner("Processing..."):
+                response = process_query(user_input, target_language, st.session_state.memory)
+                st.session_state.chat_history.append({"user": user_input, "assistant": response})
+                st.success("Done!")
+                st.write(f"**Assistant:** {response}")
+
+    elif input_mode == "Voice":
+        if st.button("Record Voice Query"):
+            with st.spinner("Listening..."):
+                voice_query = get_voice_query()
+                st.write(f"Recognized: {voice_query}")
+                if "Error" not in voice_query and "Sorry" not in voice_query:
+                    response = process_query(voice_query, target_language, st.session_state.memory)
+                    st.session_state.chat_history.append({"user": voice_query, "assistant": response})
+                    st.write(f"**Assistant:** {response}")
+                else:
+                    st.error(voice_query)
+                st.success("Done!")
+
+# Right Column: Image Upload and Query
+with col2:
+    st.subheader("Fitness Image Assistance")
+    uploaded_file = st.file_uploader("Upload a fitness image", type=["png", "jpg", "jpeg"])
+    if uploaded_file is not None:
+        image = Image.open(uploaded_file)
+        st.image(image, caption='Uploaded Image', use_column_width=True)
+
+        user_query = st.text_input("Enter your query related to this image", key="image_query")
+        if st.button("Submit Image Query") and user_query:
+            with st.spinner("Processing image query..."):
+                # Save uploaded file temporarily
+                temp_file_path = f"temp_{uploaded_file.name}"
+                with open(temp_file_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                response = process_image_query(temp_file_path, user_query, target_language)
+                st.markdown(f"> {response}")
+                # Clean up temporary file
+                os.remove(temp_file_path)
+                st.session_state.chat_history.append({"user": f"Image Query: {user_query}", "assistant": response})
+                st.success("Done!")
