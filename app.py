@@ -28,10 +28,10 @@ else:
 
 
 GENERATION_CONFIG = {
-    "temperature": 0.5,
-    "top_p": 0.95,
-    "top_k": 40,
-    "max_output_tokens": 1024,
+    "temperature": 0.3,  # Lower for more focused responses
+    "top_p": 0.85,
+    "top_k": 20,
+    "max_output_tokens": 2048,  # Increased for detailed workout/meal plans
 }
 
 MODEL_NAME = "gemini-2.5-flash"
@@ -52,39 +52,15 @@ search_tool = DuckDuckGoSearchRun(api_wrapper=DuckDuckGoSearchAPIWrapper())
 
 ACTION_PATTERN = re.compile(r"^ACTION:\s*(?P<name>[a-z_]+)\s*\|\s*(?P<payload>.*)$", re.IGNORECASE | re.MULTILINE)
 
-FITNESS_SYSTEM_PROMPT = (
-    "You are a supportive fitness assistant. Answer the user's request directly and keep responses concise."
-)
+FITNESS_SYSTEM_PROMPT = "You are a professional fitness assistant. Provide detailed, comprehensive, and actionable advice."
 
 ACTION_GUIDE = (
-    "If the user asks for a workout, meal plan, motivational quote, protein recommendation, or diet-friendly places,"
-    " call the matching tool using one line formatted exactly as: ACTION: <tool_name> | <input>."
-    " Available tools: generate_workout, suggest_meal, motivational_quotes, recommend_protein, recommend_diet_hotels."
-    " After receiving tool results, give a final helpful answer without requesting another action."
+    "TOOLS: generate_workout(level), suggest_meal(prefs), motivational_quotes(), recommend_protein(focus), recommend_diet_hotels(location).\n"
+    "If user asks for workout/meal/quote/protein/restaurants, respond ONLY: ACTION: tool_name | input\n"
+    "Otherwise, provide a detailed, helpful answer with specific information."
 )
 
-def _normalise_level(level: str) -> str:
-    token = (level or "").strip().lower()
-    if "beg" in token:
-        return "beginner"
-    if "inter" in token:
-        return "intermediate"
-    if "adv" in token:
-        return "advanced"
-    return "beginner"
-
-def _looks_unusable(text: str) -> bool:
-    if not text:
-        return True
-    lowered = text.lower()
-    failure_markers = [
-        "snag",
-        "try again",
-        "api key",
-        "error",
-        "unavailable",
-    ]
-    return any(marker in lowered for marker in failure_markers)
+# All logic handled by LLM - no hardcoded rules
 
 
 def _describe_finish_reason(response: Any) -> str:
@@ -127,18 +103,7 @@ def extract_model_text(response: Any) -> str:
     return ""
 
 
-def generate_with_retry(prompt_builder, max_attempts: int = 3) -> str:
-    last_response = ""
-    for attempt in range(max_attempts):
-        prompt = prompt_builder(attempt)
-        response = generate_text(prompt)
-        if not _looks_unusable(response):
-            return response
-        last_response = response
-    return (
-        "I'm running into upstream limits right now, so I can't share the full plan yet. "
-        f"(Latest response: {last_response})"
-    )
+# Removed retry mechanism to optimize response time
 
 
 def _resolve_translation(result, fallback: str) -> str:
@@ -212,7 +177,7 @@ def generate_text(prompt: str) -> str:
 
 def compose_prompt(conversation: List[Dict[str, str]], allow_action: bool) -> str:
     history_lines = []
-    for message in conversation:
+    for message in conversation[-6:]:  # Only last 6 messages to reduce context
         role = message["role"]
         content = message["content"].strip()
         if not content:
@@ -222,86 +187,90 @@ def compose_prompt(conversation: List[Dict[str, str]], allow_action: bool) -> st
         elif role == "assistant":
             history_lines.append(f"Assistant: {content}")
         elif role == "tool":
-            history_lines.append(f"Tool: {content}")
+            # Keep full tool output for detailed context
+            history_lines.append(f"Data: {content}")
 
-    history_text = "\n".join(history_lines).strip()
-    guidance = FITNESS_SYSTEM_PROMPT
+    history_text = "\n".join(history_lines)
+    
     if allow_action:
-        guidance = f"{FITNESS_SYSTEM_PROMPT}\n\n{ACTION_GUIDE}"
+        guidance = f"{FITNESS_SYSTEM_PROMPT}\n{ACTION_GUIDE}"
     else:
-        guidance = (
-            f"{FITNESS_SYSTEM_PROMPT}\n\nYou already have the tool output above. Summarise it and answer the user without calling any more tools."
-        )
+        guidance = f"{FITNESS_SYSTEM_PROMPT}\nPresent the complete data above in a clear, formatted way."
 
-    prompt_parts = [guidance]
-    if history_text:
-        prompt_parts.append(f"Conversation so far:\n{history_text}")
-    prompt_parts.append("Assistant:")
-    return "\n\n".join(prompt_parts)
+    return f"{guidance}\n\n{history_text}\nAssistant:"
 
 
 def generate_workout(level: str) -> str:
-    normalised_level = _normalise_level(level)
-    def build_prompt(attempt: int) -> str:
-        reinforcement = "Respond in Markdown with a header and a table that has columns Day, Focus, Warm-up, Main Sets, Cool-down."
-        if attempt > 0:
-            reinforcement += " Avoid apologies or deferrals—produce the plan immediately."
-        if attempt > 1:
-            reinforcement += " Keep the table to 7 rows, one per day, and include short coaching cues in the Main Sets column."
-        return (
-            f"User fitness level: {normalised_level}. Create a 7-day workout schedule with balanced strength, cardio, and recovery.\n"
-            f"{reinforcement}"
-        )
-
-    return generate_with_retry(build_prompt)
+    prompt = (
+        f"Create a comprehensive 7-day workout plan for {level or 'general fitness'} level.\n\n"
+        f"Format as a detailed markdown table with these columns:\n"
+        f"Day | Focus | Warm-up (5-10min) | Main Exercises | Sets x Reps/Duration | Cool-down | Notes\n\n"
+        f"Requirements:\n"
+        f"- Include 2 full-body strength training days with specific exercises\n"
+        f"- Include 2 cardio days with intensity levels and duration\n"
+        f"- Include 1 active recovery day (yoga, stretching, light walk)\n"
+        f"- Include 2 complete rest days\n"
+        f"- For each exercise, specify sets, reps, and rest periods\n"
+        f"- Add helpful coaching tips in the Notes column\n"
+        f"- Make it practical and equipment-specific (bodyweight, dumbbells, or gym)\n\n"
+        f"Provide the complete 7-day breakdown with all details filled in."
+    )
+    return generate_text(prompt)
 
 
 def suggest_meal(preferences: str) -> str:
-    preferences = preferences or "high-protein balanced nutrition"
+    preferences = preferences or "high-protein"
     prompt = (
-        f"{FITNESS_SYSTEM_PROMPT}\n\n"
-        f"Create a one-day meal outline aligned with {preferences}. List breakfast, lunch, dinner, and snacks with macros." 
+        f"Create a detailed one-day {preferences} meal plan.\n\n"
+        f"Format as a markdown table with columns:\n"
+        f"Meal | Time | Food Items | Portion Size | Calories | Protein(g) | Carbs(g) | Fat(g) | Prep Notes\n\n"
+        f"Include:\n"
+        f"- Breakfast, Mid-morning snack, Lunch, Afternoon snack, Dinner, Evening snack (if needed)\n"
+        f"- Specific ingredients and quantities\n"
+        f"- Total daily macros at the bottom\n"
+        f"- Quick prep instructions or tips\n\n"
+        f"Make it practical and delicious."
     )
     return generate_text(prompt)
 
 
 def motivational_quotes(_: str = "") -> str:
-    prompt = (
-        f"{FITNESS_SYSTEM_PROMPT}\n\nShare one short motivational quote tailored to someone working on their fitness routine." 
-    )
+    prompt = "One short fitness motivation quote. No explanation."
     return generate_text(prompt)
 
 
 def summarise_search(query: str, task_instruction: str) -> str:
     try:
         snippets = search_tool.run(query)
+        # Limit snippets but allow more for detailed responses
+        if len(snippets) > 2000:
+            snippets = snippets[:2000] + "..."
     except Exception:
-        return "I could not reach the search service just now. Please try again soon."
-    prompt = (
-        f"{FITNESS_SYSTEM_PROMPT}\n\n"
-        f"Search snippets for '{query}':\n{snippets}\n\n"
-        f"Task: {task_instruction}"
-    )
+        return "Search unavailable. Try again later."
+    prompt = f"Based on this data: {snippets}\n\nTask: {task_instruction}\n\nProvide detailed, well-structured information."
     return generate_text(prompt)
 
 
 def recommend_protein(focus: str = "") -> str:
-    query = "best live protein supplements with nutrition facts and prices"
-    if focus:
-        query += f" for {focus}"
+    query = f"protein supplements {focus} 2024" if focus else "best protein supplements 2024"
     task = (
-        "Summarise the top options with serving size, protein per scoop, key ingredients, price range, and purchase links when present. "
-        "Conclude with how to pick the right supplement based on goals."
+        "Create a detailed comparison of top 3-5 protein supplements.\n"
+        "For each, include: Brand name, Product name, Protein per serving, "
+        "Serving size, Key ingredients, Price range, Flavor options, "
+        "Best for (goal/use case), Where to buy.\n"
+        "Format as a clear comparison with pros and cons."
     )
     return summarise_search(query, task)
 
 
 def recommend_diet_hotels(location: str = "") -> str:
-    query = "best healthy meal prep services and diet-friendly restaurants online"
-    if location:
-        query += f" in {location}"
+    query = f"healthy restaurants meal prep {location}" if location else "healthy meal delivery services"
     task = (
-        "Highlight 3-4 services with signature dishes, macro focus, ordering method, and delivery or dining details."
+        "List 4-5 healthy eating options with details:\n"
+        "Name, Type (restaurant/delivery/meal prep), Specialty dishes, "
+        "Macro information available, Price range, Ordering method, "
+        "Delivery/location details, Best for.\n"
+        "Format clearly with all details."
     )
     return summarise_search(query, task)
 
@@ -404,14 +373,12 @@ def process_image_query(image_path: str, user_query: str) -> str:
         uploaded = genai.upload_file(path=image_path, display_name="fitness-image")
         
         analysis_prompt = (
-            "You are a professional fitness coach analyzing exercise form and technique. "
-            "This is for legitimate fitness education purposes.\n\n"
-            f"User question: {user_query}\n\n"
-            "Provide constructive coaching feedback covering:\n"
-            "1. What you observe in the image (exercise, setting, equipment)\n"
-            "2. Form and technique observations\n"
-            "3. Specific improvement suggestions\n"
-            "Keep your response professional, educational, and focused on athletic performance."
+            f"Fitness coach analyzing form. User asks: {user_query or 'Analyze this'}\n\n"
+            "Respond in 3 bullet points:\n"
+            "1. Exercise/equipment observed\n"
+            "2. Form assessment\n"
+            "3. One improvement tip\n"
+            "Brief and actionable only."
         )
         
         response = model.generate_content([uploaded, analysis_prompt])
@@ -446,7 +413,7 @@ def init_session_state():
     if "conversation" not in st.session_state:
         st.session_state.conversation = []
     if "messages" not in st.session_state:
-        welcome = "Hey! I'm ready with workouts, meals, and supplement pointers. Tell me your goal to get started."
+        welcome = "Ready with workouts, meals, and supplements. What's your goal?"
         st.session_state.messages = [{"role": "assistant", "content": welcome}]
         st.session_state.conversation.append({"role": "assistant", "content": welcome})
 
